@@ -14,7 +14,18 @@
 #define __LINUX_CPUFREQ_LIMIT_H__
 
 /* sched boost type from kernel/sched/sched.h */
+#ifdef CONFIG_SCHED_WALT
 extern int sched_set_boost(int enable);
+#else
+/*
+ * kernel/sched/walt/ is built only under CONFIG_SCHED_WALT
+ * (obj-$(CONFIG_SCHED_WALT) += walt/ in kernel/sched/Makefile), and that is
+ * where sched_set_boost() is defined (kernel/sched/walt/boost.c). With WALT
+ * off the symbol does not exist at all, so give callers the same stub that
+ * kernel/sched/walt/qc_vas.h uses rather than link against nothing.
+ */
+static inline int sched_set_boost(int enable) { return -EINVAL; }
+#endif
 #define NO_BOOST (CONSERVATIVE_BOOST * -1)
 #define FULL_THROTTLE_BOOST 1
 #define CONSERVATIVE_BOOST 2
