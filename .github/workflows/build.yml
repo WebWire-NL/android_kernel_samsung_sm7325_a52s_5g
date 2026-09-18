@@ -9,7 +9,13 @@ name: Build a52sxq Docker kernel
 #     linux-arm64 equivalent (that archive path returns 400).
 #   * Larger runners need a Team/Enterprise org - not available to a user account.
 #   * ubuntu-22.04 is the default because that is the host this build is proven on.
-#     ubuntu-latest currently resolves to 24.04, which changes the apt gcc (13 vs 11).
+#     ubuntu-latest resolves to 24.04 today (apt gcc 13, not 11), and per the
+#     2026-09-17 changelog it migrates to 26.04 between 19 Oct and 19 Nov 2026,
+#     so the moving label is not offered here any more.
+#   * Action pins are Node-24 majors on purpose (checkout v7 / cache v6 /
+#     upload-artifact v7): Node 20 is removed from the hosted runners on
+#     23 Sep 2026, and the v4 pins were already being force-run on Node 24 with a
+#     deprecation warning in the log.
 on:
   workflow_dispatch:
     inputs:
@@ -22,7 +28,6 @@ on:
           - ubuntu-22.04
           - ubuntu-24.04
           - ubuntu-26.04
-          - ubuntu-latest
       free_disk:
         description: "Free disk + add 8G swap (not strictly needed: ~87G free already)"
         required: true
@@ -75,7 +80,7 @@ jobs:
           df -h /
 
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0          # build_kernel_zip.sh runs `git tag -l` in submodules for the version string
           submodules: recursive
@@ -87,7 +92,7 @@ jobs:
       # to the clang revision the script requests, so bumping CLANG_URL in the
       # script (or the key here) invalidates it.
       - name: Cache toolchain (clang-r530567 + magiskboot + avbtool)
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             toolchain/clang
@@ -96,7 +101,17 @@ jobs:
           key: ${{ runner.os }}-${{ runner.arch }}-a52sxq-clang-r530567-v1
 
       - name: Make branch name visible to the build script
-        run: git checkout -B "${GITHUB_REF_NAME}"
+        run: |
+          # build_kernel_zip.sh infers the ROM type from "*aosp*"/"*oneui*" and the
+          # root solution from a "resukisu*"/"ksu-next*" prefix in the LOCAL branch
+          # name, and under `set -u` it aborts with "ROM_DISPLAY: unbound variable"
+          # on a name that matches neither. GitHub refs cannot carry those markers
+          # (they would have to be plain "resukisu-aosp-..." branches), so create
+          # the local branch with a name the script understands. The GitHub ref is
+          # untouched - the release tag below still uses github.ref_name.
+          LOCAL_BRANCH="resukisu-aosp-${GITHUB_REF_NAME//\//-}"
+          echo "branch name handed to build_kernel_zip.sh: $LOCAL_BRANCH"
+          git checkout -B "$LOCAL_BRANCH"
 
       - name: Install build dependencies
         run: |
@@ -141,7 +156,7 @@ jobs:
           exit $fail
 
       - name: Upload flashable zip
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: a52sxq-docker-kernel
           path: "*.zip"
@@ -152,8 +167,11 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          TAG="${{ github.ref_name }}-run${{ github.run_number }}"
+          # github.ref_name can contain "/" (ci/optimize-docker-build); git tags
+          # may too, but flatten it so the tag is easy to type.
+          REF="${GITHUB_REF_NAME//\//-}"
+          TAG="${REF}-run${GITHUB_RUN_NUMBER}"
           gh release create "$TAG" --repo "${{ github.repository }}" \
-            --title "a52sxq Docker kernel (${{ github.ref_name }} #${{ github.run_number }})" \
+            --title "a52sxq Docker kernel (${GITHUB_REF_NAME} #${GITHUB_RUN_NUMBER})" \
             --notes "Built from \`${{ github.sha }}\` with the LXC/Docker kernel options enabled." \
             *.zip
