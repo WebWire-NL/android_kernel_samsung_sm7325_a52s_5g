@@ -76,6 +76,7 @@ case "$CURRENT_BRANCH" in
     *)
         warn "Branch '$CURRENT_BRANCH' doesn't match any known ROM type — defaulting to AOSP"
         ROM_TYPE="AOSP"
+        ROM_DISPLAY="AOSP"
         ;;
 esac
 
