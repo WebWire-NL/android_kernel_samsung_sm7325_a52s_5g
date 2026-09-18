@@ -243,8 +243,17 @@ jobs:
           #    holder keeps that session's stdin open so the shell the relay
           #    starts does not see EOF and take the tunnel down with it.
           exec 3< <(sleep $(( SESSION_MINUTES * 60 + 300 )))
+          # tcp@ matters: without it pinggy serves HTTP, authenticates fine,
+          # accepts the forward, and then hands out https://<name>.free.pinggy.net
+          # and https://<name>.run.pinggy-free.link - HTTP endpoints wrapped
+          # around port 22, which cannot be ssh'd to (run 35385176199).
+          # serveo.net and localhost.run stay as fallbacks but are expected to
+          # refuse: serveo answers "Permission denied (publickey,keyboard-
+          # interactive)" for anonymous users now, and localhost.run authenticates
+          # with "none" and then logs "remote forward failure for: listen 0,
+          # connect localhost:22". Both measured in run 35385176199.
           declare -A FLAGS=(
-            [pinggy]="-p 443 a.pinggy.io"
+            [pinggy]="-p 443 tcp@a.pinggy.io"
             [serveo]="-o BatchMode=yes serveo.net"
             [localhost.run]="-o BatchMode=yes nokey@localhost.run"
           )
