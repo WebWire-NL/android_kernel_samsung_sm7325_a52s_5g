@@ -4,6 +4,14 @@ name: Build a52sxq Docker kernel
 #   * Public repo -> standard runners are free and unlimited. 4 vCPU / 16 GB.
 #   * Disk is NOT tight: the runner reported a 146 G root with 87 G free
 #     BEFORE free-disk-space ran. The "14 GB" in the docs is a floor.
+#   * So free-disk-space is OFF by default (free_disk, below). It gives back
+#     ~19 G - 59 G used -> 40 G used - and costs 1m52s of every single run
+#     (04:04:20 -> 04:06:14 in run 35305547290, 18:47:10 -> 18:49:02 in
+#     35382185200). 87 G is ample for this build, and "Report the disk the build
+#     used" now prints what it actually took, so that stays a measured fact
+#     rather than a guess.
+#   * The 8 G swapfile is unconditional: the vmlinux link is memory hungry, the
+#     runner has 15 G of RAM, and fallocate + mkswap costs about a second.
 #   * ARM runners are free too, but unusable here: build_kernel_zip.sh pins
 #     CLANG_URL to prebuilts/clang/host/linux-x86 (x86_64-host). There is no
 #     linux-arm64 equivalent (that archive path returns 400).
@@ -29,10 +37,10 @@ on:
           - ubuntu-24.04
           - ubuntu-26.04
       free_disk:
-        description: "Free disk + add 8G swap (not strictly needed: ~87G free already)"
+        description: "Delete ~19G of preinstalled SDKs/.NET/docker images, for 1m52s - the runner already starts with 87G free"
         required: true
         type: boolean
-        default: true
+        default: false
       publish_release:
         description: "Publish the zip as a GitHub release (artifacts expire in 90 days)"
         required: true
@@ -65,7 +73,6 @@ jobs:
           swap-storage: false
 
       - name: Add swap (the vmlinux link is memory hungry)
-        if: ${{ inputs.free_disk }}
         run: |
           sudo fallocate -l 8G /mnt/swapfile
           sudo chmod 600 /mnt/swapfile
@@ -154,6 +161,14 @@ jobs:
           echo "--- informational: SCHED_WALT must be OFF (CFS_BANDWIDTH needs !SCHED_WALT) ---"
           grep -E "^# CONFIG_SCHED_WALT is not set" "$CFG" || true
           exit $fail
+
+      # Answers "did we actually need to free disk?" from the log itself, next
+      # time it comes up.
+      - name: Report the disk the build used
+        if: always()
+        run: |
+          df -h /
+          du -sh out toolchain 2>/dev/null || true
 
       - name: Upload flashable zip
         uses: actions/upload-artifact@v7
