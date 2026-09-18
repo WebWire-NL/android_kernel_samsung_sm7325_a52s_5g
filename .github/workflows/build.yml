@@ -1,0 +1,43 @@
+name: Build a52sxq Docker kernel
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Docker-capable a52sxq kernel
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Make branch name visible to the build script
+        run: git checkout -B "${GITHUB_REF_NAME}"
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bc bison flex libssl-dev libelf-dev \
+            zip unzip cpio rsync kmod python3 device-tree-compiler lz4 zstd \
+            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
+
+      - name: Enable Docker / LXC kernel options in the defconfig
+        run: |
+          curl -sL -o cfg.py https://raw.githubusercontent.com/dabao1955/kernel_build_action/main/config.py
+          python3 cfg.py -t lxc -w arch/arm64/configs/vendor/a52sxq_kor_single_defconfig
+
+      - name: Build kernel and flashable zip
+        run: bash build_kernel_zip.sh
+
+      - name: Upload flashable zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: a52sxq-docker-kernel
+          path: "*.zip"
+          if-no-files-found: error
