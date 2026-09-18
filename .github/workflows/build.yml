@@ -1,43 +1,51 @@
 name: Build a52sxq Docker kernel
 
-# Runner choice, and why it is what it is:
-#   * This repo is PUBLIC, so the standard GitHub-hosted runners are free and
-#     unlimited here (4 vCPU / 16 GB RAM / 14 GB SSD, x86_64).
-#   * Larger runners are NOT available: they require a Team/Enterprise org, and
-#     this repo is owned by a personal account (User). Confirmed: the org
-#     hosted-runners and runner-groups endpoints both 404.
-#   * There are no self-hosted runners registered on this repo (total_count: 0).
-#   * ARM labels (ubuntu-22.04-arm / ubuntu-24.04-arm) are free on a public repo
-#     too, but are NOT usable here: build_kernel_zip.sh downloads
-#     android.googlesource.com/platform/prebuilts/clang/host/linux-x86/...
-#     i.e. an x86_64-host clang, which cannot execute on an arm64 runner.
-# So the only real knobs are the x86_64 label, and freeing disk - 14 GB is tight
-# for a Linux 5.4 build plus modules plus a flashable zip.
+# Runner notes (verified against run 35305547290 and the GitHub docs):
+#   * Public repo -> standard runners are free and unlimited. 4 vCPU / 16 GB.
+#   * Disk is NOT tight: the runner reported a 146 G root with 87 G free
+#     BEFORE free-disk-space ran. The "14 GB" in the docs is a floor.
+#   * ARM runners are free too, but unusable here: build_kernel_zip.sh pins
+#     CLANG_URL to prebuilts/clang/host/linux-x86 (x86_64-host). There is no
+#     linux-arm64 equivalent (that archive path returns 400).
+#   * Larger runners need a Team/Enterprise org - not available to a user account.
+#   * ubuntu-22.04 is the default because that is the host this build is proven on.
+#     ubuntu-latest currently resolves to 24.04, which changes the apt gcc (13 vs 11).
 on:
   workflow_dispatch:
     inputs:
       runner:
-        description: "Runner label (x86_64 only - see the note at the top)"
+        description: "Runner label (x86_64 only - the pinned AOSP clang is x86_64-host)"
         required: true
         type: choice
         default: "ubuntu-22.04"
         options:
           - ubuntu-22.04
           - ubuntu-24.04
+          - ubuntu-26.04
           - ubuntu-latest
       free_disk:
-        description: "Free up disk and add 8G swap before building"
+        description: "Free disk + add 8G swap (not strictly needed: ~87G free already)"
         required: true
         type: boolean
         default: true
+      publish_release:
+        description: "Publish the zip as a GitHub release (artifacts expire in 90 days)"
+        required: true
+        type: boolean
+        default: false
 
 permissions:
   contents: write
+
+concurrency:
+  group: a52sxq-${{ github.ref }}-${{ inputs.runner }}
+  cancel-in-progress: false
 
 jobs:
   build:
     name: Docker-capable a52sxq kernel
     runs-on: ${{ inputs.runner }}
+    timeout-minutes: 120
     steps:
       - name: Free up disk space
         if: ${{ inputs.free_disk }}
@@ -69,8 +77,23 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          fetch-depth: 0          # build_kernel_zip.sh runs `git tag -l` in submodules for the version string
           submodules: recursive
+
+      # ---- the optimisation -------------------------------------------------
+      # build_kernel_zip.sh skips anything already present and working (its
+      # "already present ... skipping" branches), so caching toolchain/ turns
+      # the 987 MB / 4m32s clang download+extract into a restore. Key is pinned
+      # to the clang revision the script requests, so bumping CLANG_URL in the
+      # script (or the key here) invalidates it.
+      - name: Cache toolchain (clang-r530567 + magiskboot + avbtool)
+        uses: actions/cache@v4
+        with:
+          path: |
+            toolchain/clang
+            toolchain/magiskboot
+            toolchain/avbtool
+          key: ${{ runner.os }}-${{ runner.arch }}-a52sxq-clang-r530567-v1
 
       - name: Make branch name visible to the build script
         run: git checkout -B "${GITHUB_REF_NAME}"
@@ -87,8 +110,35 @@ jobs:
           curl -sL -o cfg.py https://raw.githubusercontent.com/dabao1955/kernel_build_action/main/config.py
           python3 cfg.py -t lxc -w arch/arm64/configs/vendor/a52sxq_kor_single_defconfig
 
+      - name: Add the option the LXC profile does not cover
+        run: |
+          # cfg.py's LXC profile leaves SYSVIPC off. IPC_NS still validates
+          # (init/Kconfig:1129 "depends on (SYSVIPC || POSIX_MQUEUE)"), but
+          # System V IPC (shmget/semget/msgget) is then unavailable in
+          # containers. Last occurrence wins in a defconfig, so appending is enough.
+          DEFCONFIG=arch/arm64/configs/vendor/a52sxq_kor_single_defconfig
+          printf '\n# ---- appended by CI ----\nCONFIG_SYSVIPC=y\n' >> "$DEFCONFIG"
+          tail -4 "$DEFCONFIG"
+
       - name: Build kernel and flashable zip
         run: bash build_kernel_zip.sh
+
+      - name: Verify the Docker options actually landed in out/.config
+        run: |
+          CFG=out/.config
+          test -f "$CFG" || { echo "no $CFG produced"; exit 1; }
+          fail=0
+          for opt in CONFIG_PID_NS CONFIG_SYSVIPC CONFIG_POSIX_MQUEUE CONFIG_IPC_NS \
+                     CONFIG_CGROUP_DEVICE CONFIG_BRIDGE_NETFILTER CONFIG_IP6_NF_NAT \
+                     CONFIG_IP6_NF_TARGET_MASQUERADE CONFIG_NETFILTER_XT_MATCH_ADDRTYPE \
+                     CONFIG_USER_NS CONFIG_CGROUP_PIDS CONFIG_BLK_DEV_THROTTLING \
+                     CONFIG_OVERLAY_FS CONFIG_VETH CONFIG_BRIDGE CONFIG_CGROUPS \
+                     CONFIG_NET_NS CONFIG_UTS_NS CONFIG_SECCOMP_FILTER CONFIG_CFS_BANDWIDTH; do
+            if grep -q "^${opt}=y" "$CFG"; then echo "OK      $opt"; else echo "MISSING $opt"; fail=1; fi
+          done
+          echo "--- informational: SCHED_WALT must be OFF (CFS_BANDWIDTH needs !SCHED_WALT) ---"
+          grep -E "^# CONFIG_SCHED_WALT is not set" "$CFG" || true
+          exit $fail
 
       - name: Upload flashable zip
         uses: actions/upload-artifact@v4
@@ -96,3 +146,14 @@ jobs:
           name: a52sxq-docker-kernel
           path: "*.zip"
           if-no-files-found: error
+
+      - name: Publish release
+        if: inputs.publish_release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ github.ref_name }}-run${{ github.run_number }}"
+          gh release create "$TAG" --repo "${{ github.repository }}" \
+            --title "a52sxq Docker kernel (${{ github.ref_name }} #${{ github.run_number }})" \
+            --notes "Built from \`${{ github.sha }}\` with the LXC/Docker kernel options enabled." \
+            *.zip
