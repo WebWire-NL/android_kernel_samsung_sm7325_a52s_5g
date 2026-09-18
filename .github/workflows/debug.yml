@@ -235,45 +235,61 @@ jobs:
             echo "sshd is NOT listening"; exit 1
           fi
 
-          # 2. The reverse tunnel. -N: no remote command. ExitOnForwardFailure so a
-          #    refused forward fails this step instead of hanging the way the dead
-          #    tmate rendezvous did.
-          case "$RENDEZVOUS" in
-            pinggy)        REMOTE=(-p 443 a.pinggy.io) ;;
-            serveo)        REMOTE=(-o BatchMode=yes serveo.net) ;;
-            localhost.run) REMOTE=(-o BatchMode=yes nokey@localhost.run) ;;
-          esac
-          ssh -v -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-              -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -N \
-              -R 0:localhost:22 "${REMOTE[@]}" > /tmp/tunnel.log 2>&1 &
-          tunnel=$!
+          # 2. Try each rendezvous until one prints an address that can be dialled.
+          #    -N is deliberately NOT used: the address arrives on a *session*
+          #    channel, so with -N the relay accepts the forward and then prints
+          #    nothing at all (run 35384472790: "remote forward success" followed
+          #    by an empty banner, which is a tunnel nobody can dial). The fd-3
+          #    holder keeps that session's stdin open so the shell the relay
+          #    starts does not see EOF and take the tunnel down with it.
+          exec 3< <(sleep $(( SESSION_MINUTES * 60 + 300 )))
+          declare -A FLAGS=(
+            [pinggy]="-p 443 a.pinggy.io"
+            [serveo]="-o BatchMode=yes serveo.net"
+            [localhost.run]="-o BatchMode=yes nokey@localhost.run"
+          )
+          ORDER=("$RENDEZVOUS")
+          for p in pinggy serveo localhost.run; do
+            [ "$p" = "$RENDEZVOUS" ] || ORDER+=("$p")
+          done
 
-          # 3. Readiness is ssh's own signal that the relay accepted the forward
-          #    request: "remote forward success", which -v writes to the log. Do
-          #    not key this off the provider's banner - an earlier version matched
-          #    the known-hosts warning "...[a.pinggy.io]:443..." through a bare
-          #    :NNN pattern, broke out after one iteration and then held a session
-          #    whose address had never been printed (run 35383955076).
-          for i in $(seq 1 30); do
-            sleep 2
-            if ! kill -0 "$tunnel" 2>/dev/null; then
-              echo "the tunnel died before the relay accepted it:"; cat /tmp/tunnel.log; exit 1
-            fi
-            if grep -q 'remote forward success' /tmp/tunnel.log; then
-              echo "the relay accepted the forward after $(( i * 2 ))s"
+          tunnel=""; chosen=""; address=""
+          for p in "${ORDER[@]}"; do
+            log="/tmp/tunnel-$p.log"
+            echo "==== trying $p ===="
+            # shellcheck disable=SC2086
+            ssh -v -T -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+                -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 \
+                -R 0:localhost:22 ${FLAGS[$p]} <&3 > "$log" 2>&1 &
+            pid=$!
+            address=""
+            for i in $(seq 1 15); do
+              sleep 2
+              kill -0 "$pid" 2>/dev/null || break
+              address=$(grep -oE '[A-Za-z0-9.-]+:[0-9]{4,5}' "$log" | head -1 || true)
+              [ -n "$address" ] && { echo "address after $(( i * 2 ))s"; break; }
+            done
+            echo "--- $p log ---"
+            cat "$log"
+            if [ -n "$address" ]; then
+              tunnel=$pid; chosen=$p
+              echo "==== $p handed out $address ===="
               break
             fi
+            if kill -0 "$pid" 2>/dev/null; then
+              echo "==== $p accepted the forward but named no address; killing it and trying the next ===="
+              kill "$pid" 2>/dev/null || true
+            else
+              echo "==== $p's ssh exited on its own ===="
+            fi
           done
-          echo "==== address lines the provider printed ===="
-          grep -oE 'tcp://[^ ]+|https://[^ ]+|ssh [^ ]+@[^ ]+' /tmp/tunnel.log | sort -u | head -5 || true
-          echo "==== ${RENDEZVOUS} says ===="
-          cat /tmp/tunnel.log
+          if [ -z "$chosen" ]; then
+            echo "no rendezvous produced a dialable address"; exit 1
+          fi
           echo "==== how to connect ===="
-          echo "translate the provider's address to:"
-          echo "  ssh -i ~/.ssh/id_ed25519 -p <port> runner@<host>"
-          echo "e.g. tcp://rua1234.a.pinggy.io:34567 -> -p 34567 runner@rua1234.a.pinggy.io"
+          echo "  ssh -i ~/.ssh/id_ed25519 -p ${address##*:} runner@${address%:*}"
           echo "==== holding for ${SESSION_MINUTES} min ===="
           sleep $(( SESSION_MINUTES * 60 ))
-          echo "==== tunnel log as it stood at the end of the window ===="
-          cat /tmp/tunnel.log
+          echo "==== tunnel log at the end of the window ===="
+          cat "/tmp/tunnel-$chosen.log"
           echo "==== session window over; the job ends by itself now ===="
