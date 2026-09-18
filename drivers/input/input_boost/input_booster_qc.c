@@ -184,7 +184,7 @@ void ib_release_booster(long *rel_flags)
 	}
 }
 
-#ifdef USE_HMP_BOOST
+#if USE_HMP_BOOST
 void set_hmp(int level)
 {
 	if (level != current_hmp_boost) {
