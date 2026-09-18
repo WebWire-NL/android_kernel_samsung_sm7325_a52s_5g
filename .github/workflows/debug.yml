@@ -15,6 +15,12 @@ name: Manual debug session
 #   gh workflow run debug.yml --ref ci/optimize-docker-build \
 #     -f runner=ubuntu-22.04 -f open_shell=true -f session_minutes=30
 #
+# Disk and memory are split the same way build.yml splits them: free_disk is
+# off by default (it hands back ~19G - 59G used -> 40G used - for 1m52s, and the
+# runner already starts with 87G free; the whole build costs ~18G, and the green
+# run finished with 69G free), while the 8G swapfile is unconditional because the
+# vmlinux link needs it and fallocate + mkswap costs about a second.
+#
 # ── Why this is no longer mxschmitt/action-tmate ────────────────────────────
 # ssh.tmate.io stopped existing in DNS on 2026-09-18: it, nyc1.tmate.io and
 # sfo1.tmate.io answer NXDOMAIN (Status 3, SOA from harmony.ns.cloudflare.com)
@@ -77,11 +83,11 @@ on:
           - ubuntu-22.04
           - ubuntu-24.04
           - ubuntu-26.04
-      prepare:
-        description: "Free disk + add 8G swap first, exactly as the build does"
+      free_disk:
+        description: "Delete ~19G of preinstalled SDKs/.NET/docker images, for 1m52s - the runner already starts with 87G free"
         required: true
         type: boolean
-        default: true
+        default: false
       build_env:
         description: "Also make this a build-ready environment (deps, defconfig, toolchain cache)"
         required: true
@@ -121,7 +127,7 @@ jobs:
     timeout-minutes: 60
     steps:
       - name: Free up disk space
-        if: ${{ inputs.prepare }}
+        if: ${{ inputs.free_disk }}
         uses: jlumbroso/free-disk-space@v1.3.1
         with:
           tool-cache: true
@@ -133,7 +139,10 @@ jobs:
           swap-storage: false
 
       - name: Add swap (the vmlinux link is memory hungry)
-        if: ${{ inputs.prepare }}
+        # Unconditional, as in build.yml: the vmlinux link is memory hungry, the
+        # runner has 15 G of RAM, and fallocate + mkswap costs about a second.
+        # The step that costs real time is free-disk-space (1m52s), so that is
+        # the one behind a flag.
         run: |
           sudo fallocate -l 8G /mnt/swapfile
           sudo chmod 600 /mnt/swapfile
