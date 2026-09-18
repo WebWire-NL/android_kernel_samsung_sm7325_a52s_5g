@@ -20,6 +20,7 @@ jobs:
           arch: arm64
           android-version: "13"
           aosp-clang: true
+          aosp-gcc: true
           lxc: true
           lxc-patch: true
           anykernel3: true
