@@ -243,19 +243,29 @@ jobs:
             serveo)        REMOTE=(-o BatchMode=yes serveo.net) ;;
             localhost.run) REMOTE=(-o BatchMode=yes nokey@localhost.run) ;;
           esac
-          ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+          ssh -v -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
               -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -N \
               -R 0:localhost:22 "${REMOTE[@]}" > /tmp/tunnel.log 2>&1 &
           tunnel=$!
 
-          # 3. Wait for the provider to name the address, else say why not.
-          for _ in $(seq 1 30); do
+          # 3. Readiness is ssh's own signal that the relay accepted the forward
+          #    request: "remote forward success", which -v writes to the log. Do
+          #    not key this off the provider's banner - an earlier version matched
+          #    the known-hosts warning "...[a.pinggy.io]:443..." through a bare
+          #    :NNN pattern, broke out after one iteration and then held a session
+          #    whose address had never been printed (run 35383955076).
+          for i in $(seq 1 30); do
             sleep 2
             if ! kill -0 "$tunnel" 2>/dev/null; then
-              echo "the tunnel died before naming an address:"; cat /tmp/tunnel.log; exit 1
+              echo "the tunnel died before the relay accepted it:"; cat /tmp/tunnel.log; exit 1
             fi
-            if grep -qiE 'tcp://|:[0-9]{4,5}|\bport [0-9]+' /tmp/tunnel.log; then break; fi
+            if grep -q 'remote forward success' /tmp/tunnel.log; then
+              echo "the relay accepted the forward after $(( i * 2 ))s"
+              break
+            fi
           done
+          echo "==== address lines the provider printed ===="
+          grep -oE 'tcp://[^ ]+|https://[^ ]+|ssh [^ ]+@[^ ]+' /tmp/tunnel.log | sort -u | head -5 || true
           echo "==== ${RENDEZVOUS} says ===="
           cat /tmp/tunnel.log
           echo "==== how to connect ===="
@@ -264,4 +274,6 @@ jobs:
           echo "e.g. tcp://rua1234.a.pinggy.io:34567 -> -p 34567 runner@rua1234.a.pinggy.io"
           echo "==== holding for ${SESSION_MINUTES} min ===="
           sleep $(( SESSION_MINUTES * 60 ))
+          echo "==== tunnel log as it stood at the end of the window ===="
+          cat /tmp/tunnel.log
           echo "==== session window over; the job ends by itself now ===="
