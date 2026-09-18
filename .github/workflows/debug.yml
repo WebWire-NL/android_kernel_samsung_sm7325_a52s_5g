@@ -50,6 +50,11 @@ on:
         required: true
         type: boolean
         default: true
+      hold_minutes:
+        description: "How long to keep the session open (the job's own limit is 60)"
+        required: true
+        type: number
+        default: 45
 
 permissions:
   contents: read
@@ -110,3 +115,37 @@ jobs:
         uses: mxschmitt/action-tmate@v3
         with:
           limit-access-to-actor: true
+          # detached: the job must not sit inside this step waiting for someone to
+          # connect - the connection string only becomes readable when the step
+          # ends, and by then the session is gone. Detached, the steps below run
+          # immediately and hold the job (and the session) open instead.
+          detached: true
+
+      - name: Publish the connection string
+        run: |
+          # tmate's own control socket, as the action above started it. Only the
+          # ssh string is republished here: tmate restricts *ssh* logins to the
+          # actor's registered keys, which is verified behaviour of the action
+          # (it writes them to authorized_keys), whereas whether the token-based
+          # web shell honours that restriction is not. The web URL is still in
+          # this run's log, as it always is.
+          TMATE=/tmp/tmate/tmate
+          SSH_STRING="$($TMATE -S /tmp/tmate.sock display -p '#{tmate_ssh}')"
+          echo "ssh: $SSH_STRING" | tee .tmate-connection.txt
+          echo "::notice::connect with $SSH_STRING"
+
+      - name: Upload the connection string
+        uses: actions/upload-artifact@v7
+        with:
+          name: tmate-connection
+          path: .tmate-connection.txt
+          if-no-files-found: error
+
+      - name: Hold the session open
+        # The job (and with it the session) lives until this sleep ends, or until
+        # timeout-minutes above fires. Cancel the run to end it early - that also
+        # runs the action's post step, which kills the tmate session.
+        run: |
+          HOLD_MINUTES=${{ inputs.hold_minutes }}
+          echo "session held open for ${HOLD_MINUTES} minutes"
+          sleep $(( HOLD_MINUTES * 60 ))
