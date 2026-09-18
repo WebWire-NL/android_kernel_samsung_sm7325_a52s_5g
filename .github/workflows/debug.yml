@@ -1,17 +1,45 @@
 name: Manual debug session
 
-# An interactive shell on the same GitHub-hosted image the kernel build uses, so
-# a question about the runner costs a minute instead of a 27-minute build cycle.
-# Dispatch it with, for example:
+# A shell on the same GitHub-hosted image the kernel build uses, so a question
+# about the runner costs a minute instead of a 27-minute build cycle.
 #
-#   gh workflow run debug.yml --ref ci/optimize-docker-build -f runner=ubuntu-22.04
+# It is opt-in twice over, which is the point:
+#   * the trigger is workflow_dispatch only. Nothing here runs on a push, on a
+#     pull request or on a failed production build, so a red build.yml cannot by
+#     itself leave a shell open on a runner - build.yml has no session step at
+#     all (grep -i tmate .github/workflows/build.yml finds nothing).
+#   * even a manual dispatch prepares the environment and then *stops* unless
+#     open_shell is true. A forgotten flag costs a couple of minutes of runner
+#     time and opens no socket.
 #
-# The job waits for you: open the run page in a browser, expand the last step and
-# copy the "SSH: ssh ..." line, then connect with
-# `ssh -i ~/.ssh/id_ed25519 <that address>`. The API cannot help here - GitHub
-# shows a live log only to a signed-in viewer, and the archived log blob does not
-# exist until the job ends. The job resumes when you disconnect, or when
-# timeout-minutes above fires; cancelling the run also ends the session.
+#   gh workflow run debug.yml --ref ci/optimize-docker-build \
+#     -f runner=ubuntu-22.04 -f open_shell=true -f session_minutes=30
+#
+# ── Why this is no longer mxschmitt/action-tmate ────────────────────────────
+# ssh.tmate.io stopped existing in DNS on 2026-09-18: it, nyc1.tmate.io and
+# sfo1.tmate.io answer NXDOMAIN (Status 3, SOA from harmony.ns.cloudflare.com)
+# from Cloudflare DoH, Google DoH and the runner's own resolver alike, while
+# tmate.io itself has no A record. tmate 2.4.0 still runs - `new-session -d`
+# exits 0 and /tmp/tmate.sock appears - but `wait tmate-ready` can never return,
+# because there is no server to register with. Debug runs 35380689573,
+# 35381000135 and 35382182527 each sat in that step with an empty #{tmate_ssh}
+# until killed; probe run 35383093616 measured it.
+#
+# The replacement keeps the shape - a reverse SSH tunnel from the runner to a
+# public rendezvous - and rebuilds what limit-access-to-actor: true gave us: the
+# only keys sshd trusts are the ones the actor publishes at
+# api.github.com/users/<actor>/keys, so no other account can get in. Passwords
+# and root login are off, and the address is random and lives only as long as
+# this step.
+#
+# ── This repository is PUBLIC ───────────────────────────────────────────────
+#   * Everything the job prints, the tunnel address included, is world-readable.
+#     That is why the sshd is key-only (the actor's keys), passwordless and
+#     root-less, and why the rendezvous is an anonymous free endpoint on a
+#     random port.
+#   * permissions is contents: read deliberately: the session is for building and
+#     looking, not for pushing. Do not raise it.
+#   * the rendezvous operator can see the SSH stream. Do not paste secrets.
 #
 # What you land in, when build_env is true:
 #   * the same repo checkout and the same defconfig edits build.yml makes (LXC
@@ -22,7 +50,7 @@ name: Manual debug session
 #     987 MB / ~4.5 min clang download and goes straight to compiling.
 #
 # Doing a build in here:
-#   * `bash build_kernel_zip.sh` — ~25 min, and it is the *same* build CI runs.
+#   * `bash build_kernel_zip.sh` - ~25 min, and it is the *same* build CI runs.
 #   * build_kernel_zip.sh:389 is `rm -rf "${OUT_DIR}"`, so running it a second
 #     time rebuilds from scratch. If you only need to iterate on the packaging
 #     tail (boot.img / dtbo / vendor_boot / zip), delete that line (or run a copy
@@ -31,18 +59,11 @@ name: Manual debug session
 #     never writes, so a session cannot leave a half-downloaded toolchain in the
 #     cache the real build depends on.
 #
-# ── This repository is PUBLIC ────────────────────────────────────────────────
-#   * Everything the job prints, tmate connection string included, is
-#     world-readable - and action-tmate's README is explicit that with SSH keys
-#     on the GitHub profile "only those keys are authorized to connect,
-#     otherwise anybody can connect to the tmate session". WebWire-NL now has
-#     ~/.ssh/id_ed25519.pub registered against it; `limit-access-to-actor: true`
-#     is what enforces that, and it also means the step fails outright rather
-#     than opening a session if the account ever has no key registered.
-#   * permissions is contents: read deliberately: the session is for building
-#     and looking, not for pushing. Do not raise it.
-#   * tmate relays the session through tmate.io's servers, so that service can
-#     see what you type.
+# Reading the connection details: GitHub serves a live log only to a signed-in
+# browser - the API answers 404 BlobNotFound for a job that has not finished
+# (verified on run 35382185200). So watch the run page. Because the step is
+# bounded by session_minutes, the job always ends by itself and the log is then
+# archived as usual.
 
 on:
   workflow_dispatch:
@@ -66,6 +87,25 @@ on:
         required: true
         type: boolean
         default: true
+      open_shell:
+        description: "Open the interactive session (false = prepare, then exit)"
+        required: true
+        type: boolean
+        default: false
+      rendezvous:
+        description: "Public rendezvous the reverse tunnel goes through"
+        required: true
+        type: choice
+        default: "pinggy"
+        options:
+          - pinggy
+          - serveo
+          - localhost.run
+      session_minutes:
+        description: "How long the session may stay open (the job cap is 60)"
+        required: true
+        type: string
+        default: "30"
 
 permissions:
   contents: read
@@ -156,13 +196,72 @@ jobs:
           printf '\n# ---- appended by CI ----\nCONFIG_SYSVIPC=y\n' >> "$DEFCONFIG"
           tail -4 "$DEFCONFIG"
 
-      - name: Start the tmate session
-        uses: mxschmitt/action-tmate@v3
-        with:
-          limit-access-to-actor: true
-          # Deliberately *not* detached, and no later step republishes the
-          # connection string: with detached mode the daemon holds this step's
-          # stdout pipe, so the step never completes and no later step is ever
-          # reached (runs 35380689573 and 35381000135 both sat here for minutes
-          # with the following steps still pending, and connect-timeout-seconds
-          # does not change that).
+      # Evidence for the `rendezvous` choice, printed from the runner itself
+      # rather than assumed from a workstation.
+      - name: Check the rendezvous candidates from this runner
+        if: ${{ inputs.open_shell }}
+        run: |
+          for hp in a.pinggy.io:443 serveo.net:22 localhost.run:22; do
+            h=${hp%:*}; p=${hp#*:}
+            printf '%-20s dns=%s tcp=' "$hp" "$(getent hosts "$h" | head -1 | awk '{print $1}')"
+            timeout 10 bash -c "exec 3<>/dev/tcp/$h/$p" 2>/dev/null && echo open || echo closed
+          done
+
+      - name: Open an interactive session
+        if: ${{ inputs.open_shell }}
+        env:
+          ACTOR: ${{ github.actor }}
+          RENDEZVOUS: ${{ inputs.rendezvous }}
+          SESSION_MINUTES: ${{ inputs.session_minutes }}
+        run: |
+          set -euo pipefail
+
+          # 1. sshd, reachable only with the keys the actor publishes.
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq openssh-server
+          sudo mkdir -p /run/sshd
+          sudo ssh-keygen -A
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          curl -fsSL "https://api.github.com/users/${ACTOR}/keys" \
+            | python3 -c 'import json,sys; print("\n".join(k["key"] for k in json.load(sys.stdin)))' \
+            > ~/.ssh/authorized_keys
+          chmod 600 ~/.ssh/authorized_keys
+          echo "authorized_keys holds $(wc -l < ~/.ssh/authorized_keys) key(s) for ${ACTOR}"
+          sudo /usr/sbin/sshd -p 22 -o PasswordAuthentication=no -o PermitRootLogin=no -o AllowUsers=runner
+          if timeout 5 bash -c 'exec 3<>/dev/tcp/127.0.0.1/22' 2>/dev/null; then
+            echo "sshd is listening on 127.0.0.1:22"
+          else
+            echo "sshd is NOT listening"; exit 1
+          fi
+
+          # 2. The reverse tunnel. -N: no remote command. ExitOnForwardFailure so a
+          #    refused forward fails this step instead of hanging the way the dead
+          #    tmate rendezvous did.
+          case "$RENDEZVOUS" in
+            pinggy)        REMOTE=(-p 443 a.pinggy.io) ;;
+            serveo)        REMOTE=(-o BatchMode=yes serveo.net) ;;
+            localhost.run) REMOTE=(-o BatchMode=yes nokey@localhost.run) ;;
+          esac
+          ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+              -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -N \
+              -R 0:localhost:22 "${REMOTE[@]}" > /tmp/tunnel.log 2>&1 &
+          tunnel=$!
+
+          # 3. Wait for the provider to name the address, else say why not.
+          for _ in $(seq 1 30); do
+            sleep 2
+            if ! kill -0 "$tunnel" 2>/dev/null; then
+              echo "the tunnel died before naming an address:"; cat /tmp/tunnel.log; exit 1
+            fi
+            if grep -qiE 'tcp://|:[0-9]{4,5}|\bport [0-9]+' /tmp/tunnel.log; then break; fi
+          done
+          echo "==== ${RENDEZVOUS} says ===="
+          cat /tmp/tunnel.log
+          echo "==== how to connect ===="
+          echo "translate the provider's address to:"
+          echo "  ssh -i ~/.ssh/id_ed25519 -p <port> runner@<host>"
+          echo "e.g. tcp://rua1234.a.pinggy.io:34567 -> -p 34567 runner@rua1234.a.pinggy.io"
+          echo "==== holding for ${SESSION_MINUTES} min ===="
+          sleep $(( SESSION_MINUTES * 60 ))
+          echo "==== session window over; the job ends by itself now ===="
