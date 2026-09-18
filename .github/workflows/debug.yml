@@ -120,6 +120,11 @@ jobs:
           # ends, and by then the session is gone. Detached, the steps below run
           # immediately and hold the job (and the session) open instead.
           detached: true
+          # The action still parks here until connect-timeout-seconds elapses
+          # (verified: the 600s default left the step running for ten minutes
+          # before the next step could publish anything), so hand over almost
+          # immediately - the session itself keeps running either way.
+          connect-timeout-seconds: 5
 
       - name: Publish the connection string
         run: |
@@ -130,7 +135,14 @@ jobs:
           # web shell honours that restriction is not. The web URL is still in
           # this run's log, as it always is.
           TMATE=/tmp/tmate/tmate
-          SSH_STRING="$($TMATE -S /tmp/tmate.sock display -p '#{tmate_ssh}')"
+          SSH_STRING=""
+          for _ in $(seq 1 12); do
+            SSH_STRING="$($TMATE -S /tmp/tmate.sock display -p '#{tmate_ssh}' 2>/dev/null || true)"
+            [ -n "$SSH_STRING" ] && break
+            echo "tmate has not reported its ssh string yet, retrying..."
+            sleep 5
+          done
+          [ -n "$SSH_STRING" ] || { echo "no tmate ssh string after 60s"; exit 1; }
           echo "ssh: $SSH_STRING" | tee .tmate-connection.txt
           echo "::notice::connect with $SSH_STRING"
 
