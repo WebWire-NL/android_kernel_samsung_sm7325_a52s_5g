@@ -1,0 +1,313 @@
+name: Manual debug session
+
+# A shell on the same GitHub-hosted image the kernel build uses, so a question
+# about the runner costs a minute instead of a 27-minute build cycle.
+#
+# It is opt-in twice over, which is the point:
+#   * the trigger is workflow_dispatch only. Nothing here runs on a push, on a
+#     pull request or on a failed production build, so a red build.yml cannot by
+#     itself leave a shell open on a runner - build.yml has no session step at
+#     all (grep -i tmate .github/workflows/build.yml finds nothing).
+#   * even a manual dispatch prepares the environment and then *stops* unless
+#     open_shell is true. A forgotten flag costs a couple of minutes of runner
+#     time and opens no socket.
+#
+#   gh workflow run debug.yml --ref ci/optimize-docker-build \
+#     -f runner=ubuntu-22.04 -f open_shell=true -f session_minutes=30
+#
+# Disk and memory are split the same way build.yml splits them: free_disk is
+# off by default (it hands back ~19G - 59G used -> 40G used - for 1m52s, and the
+# runner already starts with 87G free; the whole build costs ~18G, and the green
+# run finished with 69G free), while the 8G swapfile is unconditional because the
+# vmlinux link needs it and fallocate + mkswap costs about a second.
+#
+# ── Why this is no longer mxschmitt/action-tmate ────────────────────────────
+# ssh.tmate.io stopped existing in DNS on 2026-09-18: it, nyc1.tmate.io and
+# sfo1.tmate.io answer NXDOMAIN (Status 3, SOA from harmony.ns.cloudflare.com)
+# from Cloudflare DoH, Google DoH and the runner's own resolver alike, while
+# tmate.io itself has no A record. tmate 2.4.0 still runs - `new-session -d`
+# exits 0 and /tmp/tmate.sock appears - but `wait tmate-ready` can never return,
+# because there is no server to register with. Debug runs 35380689573,
+# 35381000135 and 35382182527 each sat in that step with an empty #{tmate_ssh}
+# until killed; probe run 35383093616 measured it.
+#
+# The replacement keeps the shape - a reverse SSH tunnel from the runner to a
+# public rendezvous - and rebuilds what limit-access-to-actor: true gave us: the
+# only keys sshd trusts are the ones the actor publishes at
+# api.github.com/users/<actor>/keys, so no other account can get in. Passwords
+# and root login are off, and the address is random and lives only as long as
+# this step.
+#
+# ── This repository is PUBLIC ───────────────────────────────────────────────
+#   * Everything the job prints, the tunnel address included, is world-readable.
+#     That is why the sshd is key-only (the actor's keys), passwordless and
+#     root-less, and why the rendezvous is an anonymous free endpoint on a
+#     random port.
+#   * permissions is contents: read deliberately: the session is for building and
+#     looking, not for pushing. Do not raise it.
+#   * the rendezvous operator can see the SSH stream. Do not paste secrets.
+#
+# What you land in, when build_env is true:
+#   * the same repo checkout and the same defconfig edits build.yml makes (LXC
+#     profile + CONFIG_SYSVIPC), on the branch name build_kernel_zip.sh expects;
+#   * the build dependencies installed (kmod for depmod, bc, bison, flex, lz4...);
+#   * toolchain/clang, toolchain/magiskboot and toolchain/avbtool restored from
+#     the cache build.yml populates, so `bash build_kernel_zip.sh` skips its
+#     987 MB / ~4.5 min clang download and goes straight to compiling.
+#
+# Doing a build in here:
+#   * `bash build_kernel_zip.sh` - ~25 min, and it is the *same* build CI runs.
+#   * build_kernel_zip.sh:389 is `rm -rf "${OUT_DIR}"`, so running it a second
+#     time rebuilds from scratch. If you only need to iterate on the packaging
+#     tail (boot.img / dtbo / vendor_boot / zip), delete that line (or run a copy
+#     of the script without it) and the next run's `make` is incremental.
+#   * the restored toolchain is read-only here on purpose: actions/cache/restore
+#     never writes, so a session cannot leave a half-downloaded toolchain in the
+#     cache the real build depends on.
+#
+# Reading the connection details: GitHub serves a live log only to a signed-in
+# browser - the API answers 404 BlobNotFound for a job that has not finished
+# (verified on run 35382185200). So watch the run page. Because the step is
+# bounded by session_minutes, the job always ends by itself and the log is then
+# archived as usual.
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: "Runner label (the same images the build offers)"
+        required: true
+        type: choice
+        default: "ubuntu-22.04"
+        options:
+          - ubuntu-22.04
+          - ubuntu-24.04
+          - ubuntu-26.04
+      free_disk:
+        description: "Delete ~19G of preinstalled SDKs/.NET/docker images, for 1m52s - the runner already starts with 87G free"
+        required: true
+        type: boolean
+        default: false
+      build_env:
+        description: "Also make this a build-ready environment (deps, defconfig, toolchain cache)"
+        required: true
+        type: boolean
+        default: true
+      open_shell:
+        description: "Open the interactive session (false = prepare, then exit)"
+        required: true
+        type: boolean
+        default: false
+      rendezvous:
+        description: "Public rendezvous the reverse tunnel goes through"
+        required: true
+        type: choice
+        default: "pinggy"
+        options:
+          - pinggy
+          - serveo
+          - localhost.run
+      session_minutes:
+        description: "How long the session may stay open (the job cap is 60)"
+        required: true
+        type: string
+        default: "30"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: debug-${{ github.ref }}-${{ inputs.runner }}
+  cancel-in-progress: false
+
+jobs:
+  shell:
+    name: Interactive shell
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 60
+    steps:
+      - name: Free up disk space
+        if: ${{ inputs.free_disk }}
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          tool-cache: true
+          android: false
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: false
+
+      - name: Add swap (the vmlinux link is memory hungry)
+        # Unconditional, as in build.yml: the vmlinux link is memory hungry, the
+        # runner has 15 G of RAM, and fallocate + mkswap costs about a second.
+        # The step that costs real time is free-disk-space (1m52s), so that is
+        # the one behind a flag.
+        run: |
+          sudo fallocate -l 8G /mnt/swapfile
+          sudo chmod 600 /mnt/swapfile
+          sudo mkswap /mnt/swapfile
+          sudo swapon /mnt/swapfile
+
+      - name: Record the runner we actually got
+        run: |
+          echo "runner=${RUNNER_NAME} os=${RUNNER_OS} arch=${RUNNER_ARCH}"
+          nproc
+          free -h
+          df -h /
+
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      # Same reason as in build.yml: build_kernel_zip.sh picks the ROM type and
+      # the root solution out of the *local* branch name, and a ci/ name trips
+      # its `set -u` ("ROM_DISPLAY: unbound variable") after a full build.
+      - name: Name the branch for build_kernel_zip.sh
+        run: |
+          LOCAL_BRANCH="resukisu-aosp-${GITHUB_REF_NAME//\//-}"
+          echo "branch name handed to build_kernel_zip.sh: $LOCAL_BRANCH"
+          git checkout -B "$LOCAL_BRANCH"
+
+      - name: Restore the toolchain, read-only
+        if: ${{ inputs.build_env }}
+        uses: actions/cache/restore@v6
+        with:
+          path: |
+            toolchain/clang
+            toolchain/magiskboot
+            toolchain/avbtool
+          key: ${{ runner.os }}-${{ runner.arch }}-a52sxq-clang-r530567-v1
+
+      - name: Install build dependencies
+        if: ${{ inputs.build_env }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bc bison flex libssl-dev libelf-dev \
+            zip unzip cpio rsync kmod python3 device-tree-compiler lz4 zstd \
+            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
+
+      - name: Enable Docker / LXC kernel options in the defconfig
+        if: ${{ inputs.build_env }}
+        run: |
+          curl -sL -o cfg.py https://raw.githubusercontent.com/dabao1955/kernel_build_action/main/config.py
+          python3 cfg.py -t lxc -w arch/arm64/configs/vendor/a52sxq_kor_single_defconfig
+
+      - name: Add the option the LXC profile does not cover
+        if: ${{ inputs.build_env }}
+        run: |
+          # cfg.py's LXC profile leaves SYSVIPC off. IPC_NS still validates
+          # (init/Kconfig:1129 "depends on (SYSVIPC || POSIX_MQUEUE)"), but
+          # System V IPC (shmget/semget/msgget) is then unavailable in containers.
+          DEFCONFIG=arch/arm64/configs/vendor/a52sxq_kor_single_defconfig
+          printf '\n# ---- appended by CI ----\nCONFIG_SYSVIPC=y\n' >> "$DEFCONFIG"
+          tail -4 "$DEFCONFIG"
+
+      # Evidence for the `rendezvous` choice, printed from the runner itself
+      # rather than assumed from a workstation.
+      - name: Check the rendezvous candidates from this runner
+        if: ${{ inputs.open_shell }}
+        run: |
+          for hp in a.pinggy.io:443 serveo.net:22 localhost.run:22; do
+            h=${hp%:*}; p=${hp#*:}
+            printf '%-20s dns=%s tcp=' "$hp" "$(getent hosts "$h" | head -1 | awk '{print $1}')"
+            timeout 10 bash -c "exec 3<>/dev/tcp/$h/$p" 2>/dev/null && echo open || echo closed
+          done
+
+      - name: Open an interactive session
+        if: ${{ inputs.open_shell }}
+        env:
+          ACTOR: ${{ github.actor }}
+          RENDEZVOUS: ${{ inputs.rendezvous }}
+          SESSION_MINUTES: ${{ inputs.session_minutes }}
+        run: |
+          set -euo pipefail
+
+          # 1. sshd, reachable only with the keys the actor publishes.
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq openssh-server
+          sudo mkdir -p /run/sshd
+          sudo ssh-keygen -A
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          curl -fsSL "https://api.github.com/users/${ACTOR}/keys" \
+            | python3 -c 'import json,sys; print("\n".join(k["key"] for k in json.load(sys.stdin)))' \
+            > ~/.ssh/authorized_keys
+          chmod 600 ~/.ssh/authorized_keys
+          echo "authorized_keys holds $(wc -l < ~/.ssh/authorized_keys) key(s) for ${ACTOR}"
+          sudo /usr/sbin/sshd -p 22 -o PasswordAuthentication=no -o PermitRootLogin=no -o AllowUsers=runner
+          if timeout 5 bash -c 'exec 3<>/dev/tcp/127.0.0.1/22' 2>/dev/null; then
+            echo "sshd is listening on 127.0.0.1:22"
+          else
+            echo "sshd is NOT listening"; exit 1
+          fi
+
+          # 2. Try each rendezvous until one prints an address that can be dialled.
+          #    -N is deliberately NOT used: the address arrives on a *session*
+          #    channel, so with -N the relay accepts the forward and then prints
+          #    nothing at all (run 35384472790: "remote forward success" followed
+          #    by an empty banner, which is a tunnel nobody can dial). The fd-3
+          #    holder keeps that session's stdin open so the shell the relay
+          #    starts does not see EOF and take the tunnel down with it.
+          exec 3< <(sleep $(( SESSION_MINUTES * 60 + 300 )))
+          # tcp@ matters: without it pinggy serves HTTP, authenticates fine,
+          # accepts the forward, and then hands out https://<name>.free.pinggy.net
+          # and https://<name>.run.pinggy-free.link - HTTP endpoints wrapped
+          # around port 22, which cannot be ssh'd to (run 35385176199).
+          # serveo.net and localhost.run stay as fallbacks but are expected to
+          # refuse: serveo answers "Permission denied (publickey,keyboard-
+          # interactive)" for anonymous users now, and localhost.run authenticates
+          # with "none" and then logs "remote forward failure for: listen 0,
+          # connect localhost:22". Both measured in run 35385176199.
+          declare -A FLAGS=(
+            [pinggy]="-p 443 tcp@a.pinggy.io"
+            [serveo]="-o BatchMode=yes serveo.net"
+            [localhost.run]="-o BatchMode=yes nokey@localhost.run"
+          )
+          ORDER=("$RENDEZVOUS")
+          for p in pinggy serveo localhost.run; do
+            [ "$p" = "$RENDEZVOUS" ] || ORDER+=("$p")
+          done
+
+          tunnel=""; chosen=""; address=""
+          for p in "${ORDER[@]}"; do
+            log="/tmp/tunnel-$p.log"
+            echo "==== trying $p ===="
+            # shellcheck disable=SC2086
+            ssh -v -T -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+                -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 \
+                -R 0:localhost:22 ${FLAGS[$p]} <&3 > "$log" 2>&1 &
+            pid=$!
+            address=""
+            for i in $(seq 1 15); do
+              sleep 2
+              kill -0 "$pid" 2>/dev/null || break
+              address=$(grep -oE '[A-Za-z0-9.-]+:[0-9]{4,5}' "$log" | head -1 || true)
+              [ -n "$address" ] && { echo "address after $(( i * 2 ))s"; break; }
+            done
+            echo "--- $p log ---"
+            cat "$log"
+            if [ -n "$address" ]; then
+              tunnel=$pid; chosen=$p
+              echo "==== $p handed out $address ===="
+              break
+            fi
+            if kill -0 "$pid" 2>/dev/null; then
+              echo "==== $p accepted the forward but named no address; killing it and trying the next ===="
+              kill "$pid" 2>/dev/null || true
+            else
+              echo "==== $p's ssh exited on its own ===="
+            fi
+          done
+          if [ -z "$chosen" ]; then
+            echo "no rendezvous produced a dialable address"; exit 1
+          fi
+          echo "==== how to connect ===="
+          echo "  ssh -i ~/.ssh/id_ed25519 -p ${address##*:} runner@${address%:*}"
+          echo "==== holding for ${SESSION_MINUTES} min ===="
+          sleep $(( SESSION_MINUTES * 60 ))
+          echo "==== tunnel log at the end of the window ===="
+          cat "/tmp/tunnel-$chosen.log"
+          echo "==== session window over; the job ends by itself now ===="

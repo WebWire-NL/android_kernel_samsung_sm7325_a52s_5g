@@ -1,0 +1,75 @@
+name: tmate probe
+
+# Why this exists: a tmate session that never becomes ready leaves the debug
+# session job parked inside its last step forever, and GitHub does not serve a
+# live log over the API (it needs a signed-in browser, and the archived log blob
+# only appears once the job ends) - so a hang there is invisible from the
+# outside. Every command here is wrapped in `timeout`, the job ends on its own in
+# a few minutes, and the whole diagnosis is then readable from the log.
+#
+# Reproduces the action's own setup: mxschmitt/action-tmate@v3 downloads tmate
+# 2.4.0 static linux amd64 from GitHub releases (that asset answers 200 - checked)
+# and then runs `tmate -S /tmp/tmate.sock new-session -d` followed by
+# `tmate wait tmate-ready`, which is the step that can block forever.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tmate-probe-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    name: Probe tmate
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - name: DNS and TCP reachability of tmate.io
+        run: |
+          set +e
+          for h in tmate.io ssh.tmate.io nyc1.tmate.io sfo1.tmate.io; do
+            printf '%-18s ' "$h"
+            getent hosts "$h" | head -2 || echo "NO DNS"
+          done
+          echo "--- tcp 22 ---"
+          for h in tmate.io ssh.tmate.io nyc1.tmate.io; do
+            if timeout 15 bash -c "exec 3<>/dev/tcp/$h/22" 2>/dev/null; then echo "$h:22 open"; else echo "$h:22 BLOCKED or no DNS"; fi
+          done
+          echo "--- proxy env ---"
+          env | grep -i proxy || echo "no proxy variables set"
+
+      - name: tmate 2.4.0, same commands the action runs
+        run: |
+          set +e
+          curl -sSL -o /tmp/t.xz "https://github.com/tmate-io/tmate/releases/download/2.4.0/tmate-2.4.0-static-linux-amd64.tar.xz" \
+            -w "download http=%{http_code} bytes=%{size_download}\n"
+          mkdir -p /tmp/tm && tar xJf /tmp/t.xz -C /tmp/tm --strip-components=1 || { echo "untar FAILED"; ls -l /tmp/t.xz; exit 0; }
+          echo "version: $(/tmp/tm/tmate -V 2>&1)"
+
+          echo "=== new-session (120s cap) ==="
+          timeout 120 /tmp/tm/tmate -S /tmp/tmate.sock new-session -d; echo "new-session exit=$?"
+
+          echo "=== tmate's own messages ==="
+          timeout 30 /tmp/tm/tmate -S /tmp/tmate.sock show-messages 2>&1 | tail -25
+
+          echo "=== socket present? ==="
+          ls -l /tmp/tmate.sock 2>&1
+
+          echo "=== wait tmate-ready (60s cap) ==="
+          timeout 60 /tmp/tm/tmate -S /tmp/tmate.sock wait tmate-ready; echo "wait-ready exit=$?"
+
+          echo "=== connection strings ==="
+          timeout 30 /tmp/tm/tmate -S /tmp/tmate.sock display -p '#{tmate_ssh}'; echo "ssh display exit=$?"
+          timeout 30 /tmp/tm/tmate -S /tmp/tmate.sock display -p '#{tmate_web}'; echo "web display exit=$?"
+          timeout 30 /tmp/tm/tmate -S /tmp/tmate.sock list-sessions; echo "list exit=$?"
+
+      - name: Also try the action's own step, with a cap
+        run: |
+          # If the plain binary works, this tells us whether the action adds
+          # anything on top (key handling, sudo, install-dependencies).
+          echo "see the two steps above; this one exists only to keep the job open"
+          echo "long enough to read the previous step without a race"

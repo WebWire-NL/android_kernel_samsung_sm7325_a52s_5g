@@ -1,43 +1,64 @@
 name: Build a52sxq Docker kernel
 
-# Runner choice, and why it is what it is:
-#   * This repo is PUBLIC, so the standard GitHub-hosted runners are free and
-#     unlimited here (4 vCPU / 16 GB RAM / 14 GB SSD, x86_64).
-#   * Larger runners are NOT available: they require a Team/Enterprise org, and
-#     this repo is owned by a personal account (User). Confirmed: the org
-#     hosted-runners and runner-groups endpoints both 404.
-#   * There are no self-hosted runners registered on this repo (total_count: 0).
-#   * ARM labels (ubuntu-22.04-arm / ubuntu-24.04-arm) are free on a public repo
-#     too, but are NOT usable here: build_kernel_zip.sh downloads
-#     android.googlesource.com/platform/prebuilts/clang/host/linux-x86/...
-#     i.e. an x86_64-host clang, which cannot execute on an arm64 runner.
-# So the only real knobs are the x86_64 label, and freeing disk - 14 GB is tight
-# for a Linux 5.4 build plus modules plus a flashable zip.
+# Runner notes (verified against run 35305547290 and the GitHub docs):
+#   * Public repo -> standard runners are free and unlimited. 4 vCPU / 16 GB.
+#   * Disk is NOT tight: the runner reported a 146 G root with 87 G free
+#     BEFORE free-disk-space ran. The "14 GB" in the docs is a floor.
+#   * So free-disk-space is OFF by default (free_disk, below). It gives back
+#     ~19 G - 59 G used -> 40 G used - and costs 1m52s of every single run
+#     (04:04:20 -> 04:06:14 in run 35305547290, 18:47:10 -> 18:49:02 in
+#     35382185200). 87 G is ample for this build, and "Report the disk the build
+#     used" now prints what it actually took, so that stays a measured fact
+#     rather than a guess.
+#   * The 8 G swapfile is unconditional: the vmlinux link is memory hungry, the
+#     runner has 15 G of RAM, and fallocate + mkswap costs about a second.
+#   * ARM runners are free too, but unusable here: build_kernel_zip.sh pins
+#     CLANG_URL to prebuilts/clang/host/linux-x86 (x86_64-host). There is no
+#     linux-arm64 equivalent (that archive path returns 400).
+#   * Larger runners need a Team/Enterprise org - not available to a user account.
+#   * ubuntu-22.04 is the default because that is the host this build is proven on.
+#     ubuntu-latest resolves to 24.04 today (apt gcc 13, not 11), and per the
+#     2026-09-17 changelog it migrates to 26.04 between 19 Oct and 19 Nov 2026,
+#     so the moving label is not offered here any more.
+#   * Action pins are Node-24 majors on purpose (checkout v7 / cache v6 /
+#     upload-artifact v7): Node 20 is removed from the hosted runners on
+#     23 Sep 2026, and the v4 pins were already being force-run on Node 24 with a
+#     deprecation warning in the log.
 on:
   workflow_dispatch:
     inputs:
       runner:
-        description: "Runner label (x86_64 only - see the note at the top)"
+        description: "Runner label (x86_64 only - the pinned AOSP clang is x86_64-host)"
         required: true
         type: choice
         default: "ubuntu-22.04"
         options:
           - ubuntu-22.04
           - ubuntu-24.04
-          - ubuntu-latest
+          - ubuntu-26.04
       free_disk:
-        description: "Free up disk and add 8G swap before building"
+        description: "Delete ~19G of preinstalled SDKs/.NET/docker images, for 1m52s - the runner already starts with 87G free"
         required: true
         type: boolean
-        default: true
+        default: false
+      publish_release:
+        description: "Publish the zip as a GitHub release (artifacts expire in 90 days)"
+        required: true
+        type: boolean
+        default: false
 
 permissions:
   contents: write
+
+concurrency:
+  group: a52sxq-${{ github.ref }}-${{ inputs.runner }}
+  cancel-in-progress: false
 
 jobs:
   build:
     name: Docker-capable a52sxq kernel
     runs-on: ${{ inputs.runner }}
+    timeout-minutes: 120
     steps:
       - name: Free up disk space
         if: ${{ inputs.free_disk }}
@@ -52,7 +73,6 @@ jobs:
           swap-storage: false
 
       - name: Add swap (the vmlinux link is memory hungry)
-        if: ${{ inputs.free_disk }}
         run: |
           sudo fallocate -l 8G /mnt/swapfile
           sudo chmod 600 /mnt/swapfile
@@ -67,13 +87,38 @@ jobs:
           df -h /
 
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
-          fetch-depth: 0
+          fetch-depth: 0          # build_kernel_zip.sh runs `git tag -l` in submodules for the version string
           submodules: recursive
 
+      # ---- the optimisation -------------------------------------------------
+      # build_kernel_zip.sh skips anything already present and working (its
+      # "already present ... skipping" branches), so caching toolchain/ turns
+      # the 987 MB / 4m32s clang download+extract into a restore. Key is pinned
+      # to the clang revision the script requests, so bumping CLANG_URL in the
+      # script (or the key here) invalidates it.
+      - name: Cache toolchain (clang-r530567 + magiskboot + avbtool)
+        uses: actions/cache@v6
+        with:
+          path: |
+            toolchain/clang
+            toolchain/magiskboot
+            toolchain/avbtool
+          key: ${{ runner.os }}-${{ runner.arch }}-a52sxq-clang-r530567-v1
+
       - name: Make branch name visible to the build script
-        run: git checkout -B "${GITHUB_REF_NAME}"
+        run: |
+          # build_kernel_zip.sh infers the ROM type from "*aosp*"/"*oneui*" and the
+          # root solution from a "resukisu*"/"ksu-next*" prefix in the LOCAL branch
+          # name, and under `set -u` it aborts with "ROM_DISPLAY: unbound variable"
+          # on a name that matches neither. GitHub refs cannot carry those markers
+          # (they would have to be plain "resukisu-aosp-..." branches), so create
+          # the local branch with a name the script understands. The GitHub ref is
+          # untouched - the release tag below still uses github.ref_name.
+          LOCAL_BRANCH="resukisu-aosp-${GITHUB_REF_NAME//\//-}"
+          echo "branch name handed to build_kernel_zip.sh: $LOCAL_BRANCH"
+          git checkout -B "$LOCAL_BRANCH"
 
       - name: Install build dependencies
         run: |
@@ -87,12 +132,61 @@ jobs:
           curl -sL -o cfg.py https://raw.githubusercontent.com/dabao1955/kernel_build_action/main/config.py
           python3 cfg.py -t lxc -w arch/arm64/configs/vendor/a52sxq_kor_single_defconfig
 
+      - name: Add the option the LXC profile does not cover
+        run: |
+          # cfg.py's LXC profile leaves SYSVIPC off. IPC_NS still validates
+          # (init/Kconfig:1129 "depends on (SYSVIPC || POSIX_MQUEUE)"), but
+          # System V IPC (shmget/semget/msgget) is then unavailable in
+          # containers. Last occurrence wins in a defconfig, so appending is enough.
+          DEFCONFIG=arch/arm64/configs/vendor/a52sxq_kor_single_defconfig
+          printf '\n# ---- appended by CI ----\nCONFIG_SYSVIPC=y\n' >> "$DEFCONFIG"
+          tail -4 "$DEFCONFIG"
+
       - name: Build kernel and flashable zip
         run: bash build_kernel_zip.sh
 
+      - name: Verify the Docker options actually landed in out/.config
+        run: |
+          CFG=out/.config
+          test -f "$CFG" || { echo "no $CFG produced"; exit 1; }
+          fail=0
+          for opt in CONFIG_PID_NS CONFIG_SYSVIPC CONFIG_POSIX_MQUEUE CONFIG_IPC_NS \
+                     CONFIG_CGROUP_DEVICE CONFIG_BRIDGE_NETFILTER CONFIG_IP6_NF_NAT \
+                     CONFIG_IP6_NF_TARGET_MASQUERADE CONFIG_NETFILTER_XT_MATCH_ADDRTYPE \
+                     CONFIG_USER_NS CONFIG_CGROUP_PIDS CONFIG_BLK_DEV_THROTTLING \
+                     CONFIG_OVERLAY_FS CONFIG_VETH CONFIG_BRIDGE CONFIG_CGROUPS \
+                     CONFIG_NET_NS CONFIG_UTS_NS CONFIG_SECCOMP_FILTER CONFIG_CFS_BANDWIDTH; do
+            if grep -q "^${opt}=y" "$CFG"; then echo "OK      $opt"; else echo "MISSING $opt"; fail=1; fi
+          done
+          echo "--- informational: SCHED_WALT must be OFF (CFS_BANDWIDTH needs !SCHED_WALT) ---"
+          grep -E "^# CONFIG_SCHED_WALT is not set" "$CFG" || true
+          exit $fail
+
+      # Answers "did we actually need to free disk?" from the log itself, next
+      # time it comes up.
+      - name: Report the disk the build used
+        if: always()
+        run: |
+          df -h /
+          du -sh out toolchain 2>/dev/null || true
+
       - name: Upload flashable zip
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: a52sxq-docker-kernel
           path: "*.zip"
           if-no-files-found: error
+
+      - name: Publish release
+        if: inputs.publish_release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # github.ref_name can contain "/" (ci/optimize-docker-build); git tags
+          # may too, but flatten it so the tag is easy to type.
+          REF="${GITHUB_REF_NAME//\//-}"
+          TAG="${REF}-run${GITHUB_RUN_NUMBER}"
+          gh release create "$TAG" --repo "${{ github.repository }}" \
+            --title "a52sxq Docker kernel (${GITHUB_REF_NAME} #${GITHUB_RUN_NUMBER})" \
+            --notes "Built from \`${{ github.sha }}\` with the LXC/Docker kernel options enabled." \
+            *.zip
