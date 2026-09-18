@@ -1,0 +1,112 @@
+name: Manual debug session
+
+# An interactive shell on the same GitHub-hosted image the kernel build uses, so
+# a question about the runner does not cost a 27-minute build cycle. Dispatch it
+# with, for example:
+#
+#   gh workflow run debug.yml --ref ci/optimize-docker-build -f runner=ubuntu-22.04
+#
+# The job waits for you: the connection string is printed into the job log, and
+# the session stays up until the last client disconnects or the 60-minute limit
+# below is reached.
+#
+# ── Read before using: this repository is PUBLIC ──────────────────────────────
+#   * Everything the job prints, tmate connection string included, is
+#     world-readable — and mxschmitt/action-tmate's README is explicit that with
+#     SSH keys on the GitHub profile "only those keys are authorized to connect,
+#     otherwise anybody can connect to the tmate session".
+#   * WebWire-NL currently has *no* public SSH keys registered:
+#         gh api users/WebWire-NL/keys --jq length        # -> 0
+#     with the action's default (limit-access-to-actor: auto) the action would
+#     only warn — "No public SSH keys found for <actor>; continuing without them
+#     even if it is less secure" — and open the session to the internet. That is
+#     why the input is forced to true here: with no key registered the step
+#     fails with "No public SSH keys registered with WebWire-NL's GitHub
+#     profile" instead of handing out a shell. Add a key at
+#     https://github.com/settings/keys and the session becomes usable, with only
+#     that key able to connect.
+#   * permissions is contents: read on purpose: the session is for looking, not
+#     for pushing to the repository. Do not raise it.
+#   * tmate relays the session through tmate.io's servers, so that service can
+#     see what you type.
+#
+# build_kernel_zip.sh is deliberately not run for you — start it yourself in the
+# session when you want the full 27-minute build in front of you.
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: "Runner label (the same images the build offers)"
+        required: true
+        type: choice
+        default: "ubuntu-22.04"
+        options:
+          - ubuntu-22.04
+          - ubuntu-24.04
+          - ubuntu-26.04
+      prepare:
+        description: "Free disk + add 8G swap first, exactly as the build does"
+        required: true
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: debug-${{ github.ref }}-${{ inputs.runner }}
+  cancel-in-progress: false
+
+jobs:
+  shell:
+    name: Interactive shell
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 60
+    steps:
+      - name: Free up disk space
+        if: ${{ inputs.prepare }}
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          tool-cache: true
+          android: false
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: false
+
+      - name: Add swap (the vmlinux link is memory hungry)
+        if: ${{ inputs.prepare }}
+        run: |
+          sudo fallocate -l 8G /mnt/swapfile
+          sudo chmod 600 /mnt/swapfile
+          sudo mkswap /mnt/swapfile
+          sudo swapon /mnt/swapfile
+
+      - name: Record the runner we actually got
+        run: |
+          echo "runner=${RUNNER_NAME} os=${RUNNER_OS} arch=${RUNNER_ARCH}"
+          nproc
+          free -h
+          df -h /
+
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      # Same reason as in build.yml: build_kernel_zip.sh picks the ROM type and
+      # the root solution out of the *local* branch name, and a ci/ name trips
+      # its `set -u` ("ROM_DISPLAY: unbound variable") after a full build.
+      - name: Name the branch for build_kernel_zip.sh
+        run: |
+          LOCAL_BRANCH="resukisu-aosp-${GITHUB_REF_NAME//\//-}"
+          echo "branch name handed to build_kernel_zip.sh: $LOCAL_BRANCH"
+          git checkout -B "$LOCAL_BRANCH"
+
+      - name: Start the tmate session
+        uses: mxschmitt/action-tmate@v3
+        with:
+          limit-access-to-actor: true
