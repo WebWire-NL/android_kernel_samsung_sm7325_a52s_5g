@@ -1,0 +1,27 @@
+name: Build a52sxq Docker kernel
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-kernel:
+    name: Build Kernel (Docker/LXC-capable)
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Build kernel
+        uses: dabao1955/kernel_build_action@main
+        with:
+          kernel-url: https://github.com/WebWire-NL/android_kernel_samsung_sm7325_a52s_5g
+          kernel-branch: main
+          config: vendor/a52sxq_kor_single_defconfig
+          arch: arm64
+          android-version: "13"
+          aosp-clang: true
+          lxc: true
+          lxc-patch: true
+          anykernel3: true
+          release: true
+          access-token: ${{ secrets.GITHUB_TOKEN }}
