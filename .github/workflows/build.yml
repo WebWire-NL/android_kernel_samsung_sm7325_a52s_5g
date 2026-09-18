@@ -1,7 +1,35 @@
 name: Build a52sxq Docker kernel
 
+# Runner choice, and why it is what it is:
+#   * This repo is PUBLIC, so the standard GitHub-hosted runners are free and
+#     unlimited here (4 vCPU / 16 GB RAM / 14 GB SSD, x86_64).
+#   * Larger runners are NOT available: they require a Team/Enterprise org, and
+#     this repo is owned by a personal account (User). Confirmed: the org
+#     hosted-runners and runner-groups endpoints both 404.
+#   * There are no self-hosted runners registered on this repo (total_count: 0).
+#   * ARM labels (ubuntu-22.04-arm / ubuntu-24.04-arm) are free on a public repo
+#     too, but are NOT usable here: build_kernel_zip.sh downloads
+#     android.googlesource.com/platform/prebuilts/clang/host/linux-x86/...
+#     i.e. an x86_64-host clang, which cannot execute on an arm64 runner.
+# So the only real knobs are the x86_64 label, and freeing disk - 14 GB is tight
+# for a Linux 5.4 build plus modules plus a flashable zip.
 on:
   workflow_dispatch:
+    inputs:
+      runner:
+        description: "Runner label (x86_64 only - see the note at the top)"
+        required: true
+        type: choice
+        default: "ubuntu-22.04"
+        options:
+          - ubuntu-22.04
+          - ubuntu-24.04
+          - ubuntu-latest
+      free_disk:
+        description: "Free up disk and add 8G swap before building"
+        required: true
+        type: boolean
+        default: true
 
 permissions:
   contents: write
@@ -9,8 +37,35 @@ permissions:
 jobs:
   build:
     name: Docker-capable a52sxq kernel
-    runs-on: ubuntu-22.04
+    runs-on: ${{ inputs.runner }}
     steps:
+      - name: Free up disk space
+        if: ${{ inputs.free_disk }}
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          tool-cache: true
+          android: false
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: false
+
+      - name: Add swap (the vmlinux link is memory hungry)
+        if: ${{ inputs.free_disk }}
+        run: |
+          sudo fallocate -l 8G /mnt/swapfile
+          sudo chmod 600 /mnt/swapfile
+          sudo mkswap /mnt/swapfile
+          sudo swapon /mnt/swapfile
+
+      - name: Record the runner we actually got
+        run: |
+          echo "runner=${RUNNER_NAME} os=${RUNNER_OS} arch=${RUNNER_ARCH}"
+          nproc
+          free -h
+          df -h /
+
       - name: Checkout
         uses: actions/checkout@v4
         with:
