@@ -2058,7 +2058,6 @@ static struct proto hci_sk_proto = {
 static int hci_sock_create(struct net *net, struct socket *sock, int protocol,
 			   int kern)
 {
-    /*
 	struct sock *sk;
 
 	BT_DBG("sock %p", sock);
@@ -2080,10 +2079,8 @@ static int hci_sock_create(struct net *net, struct socket *sock, int protocol,
 
 	sock->state = SS_UNCONNECTED;
 	sk->sk_state = BT_OPEN;
-	sk->sk_destruct = hci_sock_destruct;
 
 	bt_sock_link(&hci_sk_list, sk);
-    */
 	return 0;
 }
 
