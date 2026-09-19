@@ -162,6 +162,21 @@ jobs:
           grep -E "^# CONFIG_SCHED_WALT is not set" "$CFG" || true
           exit $fail
 
+      - name: Verify USB host/serial options landed in out/.config
+        run: |
+          CFG=out/.config
+          test -f "$CFG" || { echo "no $CFG produced"; exit 1; }
+          fail=0
+          # ZBT-1 / SkyConnect = Silicon Labs CP2102N USB-UART -> driver cp210x
+          for opt in CONFIG_USB_SERIAL CONFIG_USB_SERIAL_CP210X CONFIG_USB_ACM \
+                     CONFIG_USB_STORAGE CONFIG_USB_UAS CONFIG_USB_XHCI_HCD \
+                     CONFIG_USB_GADGET CONFIG_USB_CONFIGFS_MASS_STORAGE; do
+            if grep -q "^${opt}=y" "$CFG"; then echo "OK      $opt"; else echo "MISSING $opt"; fail=1; fi
+          done
+          echo "--- informational: DVB core stays OFF for rtl_433 (librtlsdr claims the stick) ---"
+          grep -E "^# CONFIG_MEDIA_DIGITAL_TV_SUPPORT is not set" "$CFG" || true
+          exit $fail
+
       # Answers "did we actually need to free disk?" from the log itself, next
       # time it comes up.
       - name: Report the disk the build used
