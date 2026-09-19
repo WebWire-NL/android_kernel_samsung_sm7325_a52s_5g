@@ -188,6 +188,20 @@ jobs:
           df -h /
           du -sh out toolchain 2>/dev/null || true
 
+      - name: Verify Bluetooth transport options landed in out/.config
+        run: |
+          CFG=out/.config
+          test -f "$CFG" || { echo "no $CFG produced"; exit 1; }
+          fail=0
+          # The phone's own chip stays with Android's userspace QTI stack; these
+          # give a container its own HCI transport (USB dongle on the hub, or a
+          # serial controller attached by hand with btattach).
+          for opt in CONFIG_BT_HCIBTUSB CONFIG_BT_HCIVHCI CONFIG_BT_HCIUART \
+                     CONFIG_BT_HCIUART_H4; do
+            if grep -q "^${opt}=y" "$CFG"; then echo "OK      $opt"; else echo "MISSING $opt"; fail=1; fi
+          done
+          exit $fail
+
       - name: Upload flashable zip
         uses: actions/upload-artifact@v7
         with:

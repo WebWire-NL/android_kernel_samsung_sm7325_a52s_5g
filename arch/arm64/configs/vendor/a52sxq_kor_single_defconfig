@@ -7539,3 +7539,16 @@ CONFIG_DVB_RTL2830=y
 CONFIG_DVB_RTL2832=y
 CONFIG_DVB_RTL2832_SDR=y
 CONFIG_MEDIA_TUNER_R820T=y
+
+# ---- Bluetooth: give a container a kernel HCI transport ----
+# The phone's own chip (WCN6750 on ttyHS0) stays with Android's userspace QTI
+# stack: btpower.c claims /soc/bt_wcn6750 ("qcom,wcn6750-bt") and this tree's
+# hci_qca only matches qca6174/wcn3990/91/98, so the kernel never registers an
+# HCI device from it. These add transports a container can own instead - a USB
+# BT dongle on the hub (btusb -> hci0), a virtual controller (/dev/vhci), or a
+# serial controller attached by hand (btattach -B /dev/ttyHS0 -P h4).
+# Nothing binds at boot, so Android's Bluetooth is unaffected.
+CONFIG_BT_HCIBTUSB=y
+CONFIG_BT_HCIVHCI=y
+CONFIG_BT_HCIUART=y
+CONFIG_BT_HCIUART_H4=y
